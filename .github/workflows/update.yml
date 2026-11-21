@@ -1,0 +1,114 @@
+name: Daily SSD Registry Update
+
+on:
+  schedule:
+    - cron: '17 7 * * *'      # Каждый день в 07:17 UTC (10:17 МСК)
+  workflow_dispatch:          # Ручной запуск
+
+jobs:
+  sync:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN_SSD }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Kaggle CLI с поддержкой API-токенов (>= 1.8.0)
+        run: |
+          pip install -q --upgrade kaggle
+          kaggle --version
+          python - <<'EOF'
+          import re, subprocess
+          out = subprocess.check_output(["kaggle", "--version"], text=True).strip()
+          m = re.search(r"(\d+)\.(\d+)", out)
+          assert m and tuple(map(int, m.groups())) >= (1, 8), \
+              f"нужен kaggle CLI >= 1.8.0 для API-токенов, получен: {out}"
+          print("OK: kaggle CLI поддерживает API-токены")
+          EOF
+
+      - name: Download latest kernel output
+        run: |
+          mkdir -p ./kaggle_output
+          kaggle kernels output eavprog/cbr-unified-fetcher -p ./kaggle_output || true
+          echo "Содержимое скачанных данных:"
+          find ./kaggle_output -maxdepth 4 -type f
+
+      - name: Copy SSD files to repo root (.gz only)
+        id: copy
+        run: |
+          # Ищем папку ssd на любом уровне вложенности внутри kaggle_output
+          SRC=$(find ./kaggle_output -type d -name "ssd" | head -n 1)
+
+          if [ -z "$SRC" ]; then
+            echo "::error::Папка ssd не найдена в результатах Kaggle"
+            echo "FILES_OK=false" >> "$GITHUB_ENV"
+            exit 1
+          fi
+
+          echo "Найдена папка с данными: $SRC"
+
+          MISSING=0
+          for f in ssd.json.gz ssd_meta.json.gz; do
+            if [ -f "$SRC/$f" ]; then
+              cp "$SRC/$f" "./$f"
+              echo "✅ copied $f"
+            else
+              echo "::warning::MISSING $f в $SRC"
+              MISSING=$((MISSING+1))
+            fi
+          done
+
+          if [ "$MISSING" -gt 0 ]; then
+            echo "❌ Отсутствует $MISSING из 2 файлов — коммит пропущен"
+            echo "FILES_OK=false" >> "$GITHUB_ENV"
+          else
+            echo "✅ Все 2 файла на месте"
+            echo "FILES_OK=true" >> "$GITHUB_ENV"
+          fi
+
+      - name: Check metadata
+        id: meta
+        if: env.FILES_OK == 'true'
+        run: |
+          python - <<'EOF'
+          import gzip, json, os
+          try:
+              with gzip.open("ssd_meta.json.gz", "rt", encoding="utf-8") as f:
+                  m = json.load(f)
+
+              if not isinstance(m.get("records_count"), int) or m.get("records_count") <= 0:
+                  raise ValueError(f"records_count={m.get('records_count')}")
+
+              print(f"✓ Метаданные в порядке: {m.get('records_count')} записей.")
+              print(f"✓ Дата актуализации: {m.get('actualization_date')}")
+
+              with open(os.environ["GITHUB_ENV"], "a") as env:
+                  env.write("META_OK=true\n")
+          except Exception as e:
+              print(f"::error::Метаданные не прошли проверку: {e}")
+              with open(os.environ["GITHUB_ENV"], "a") as env:
+                  env.write("META_OK=false\n")
+          EOF
+
+      - name: Commit and push changes
+        if: env.FILES_OK == 'true' && env.META_OK == 'true'
+        run: |
+          git config --local user.email "github-actions@github.com"
+          git config --local user.name "GitHub Actions"
+          git add ssd.json.gz ssd_meta.json.gz
+
+          if git diff --cached --quiet; then
+            echo "✅ Изменений нет — данные уже актуальны"
+          else
+            ACT_DATE=$(gzip -d -c ssd_meta.json.gz | python -c "import sys, json; print(json.load(sys.stdin).get('actualization_date','?'))")
+            git commit -m "Auto-update: SSD registry data (actualized ${ACT_DATE}) [skip ci]"
+            git push
+            echo "✅ Изменения запушены"
+          fi
